@@ -1,36 +1,76 @@
 #!/usr/bin/env bash
 #
-# install_tni_studio.sh
+# install_tni_studio.sh  (v2 — resilient)
 # ----------------------------------------------------------------------------
 # The Noises Inside studio bootstrap for T2-Mint 22.3 (Cinnamon, noble base).
 #
-# Primary anchor: REAPER 7.72 (with Python ReaScript ready)
-# Secondary DAW:  Ardour (good companion + Overwitch-friendly)
-# Hardware glue:  Overwitch + Elektroid (Digitakt over USB → JACK/PipeWire)
-# Audio stack:    PipeWire-JACK (already shipping in Mint 22.3), realtime privs
-# Plugins:        LSP, Calf, x42, ZAM, Dragonfly, DPF, distrho ports
-# Soft synths:    ZynAddSubFX, Yoshimi, Surge XT, Dexed, Helm, Hydrogen
-# Plugin host:    Carla
-# Python toolkit: rtmidi, mido, sounddevice, PyQt6, pyserial
+# Anchor:    REAPER 7.72 + Python ReaScript
+# Audio:     PipeWire-JACK, 48kHz, realtime privs
+# Hardware:  Overwitch (Digitakt → JACK) + Elektroid
+# Plugins:   LSP, Calf, x42, ZAM, Dragonfly, DPF, swh, CAPS
+# Synths:    Zyn, Yoshimi, Surge XT, Dexed, Helm, Hydrogen, AMSynth, Bristol
+# Hosting:   Carla
+# Python:    rtmidi, mido, sounddevice, PyQt6, pyserial, jack-client (in venv)
 #
-# Designed to be idempotent. Run from your user account; will prompt for sudo.
-# Sections are marked SECTION N — comment any out to skip.
+# v2 changes:
+#  - Failures no longer kill the script.
+#  - Each apt package installed individually; failures tracked & reported.
+#  - SWS + ReaPack moved to manual post-install (cleaner via ReaPack GUI).
+#  - Final summary lists what installed, what failed, and remaining manual steps.
 # ----------------------------------------------------------------------------
 
-set -euo pipefail
+# Note: NO `set -e` — we want to continue past failures and report them.
+set -uo pipefail
 
-# Pretty-print helpers
+# ---------- output helpers --------------------------------------------------
 say()  { printf "\n\033[1;36m▌ %s\033[0m\n" "$*"; }
 ok()   { printf "  \033[1;32m✓\033[0m %s\n" "$*"; }
 warn() { printf "  \033[1;33m!\033[0m %s\n" "$*"; }
+err()  { printf "  \033[1;31m✗\033[0m %s\n" "$*"; }
 
-require_user() {
-  if [[ $EUID -eq 0 ]]; then
-    echo "Run as your normal user, not root. Sudo will prompt where needed." >&2
-    exit 1
+# ---------- result tracking -------------------------------------------------
+INSTALLED=()       # successfully installed (or already present) packages
+FAILED_PKGS=()     # packages apt could not install
+FAILED_STEPS=()    # higher-level step failures (build, download, etc.)
+SKIPPED_STEPS=()   # explicitly skipped sections
+
+# ---------- safety: no root -------------------------------------------------
+if [[ $EUID -eq 0 ]]; then
+  echo "Run as your normal user, not root. Sudo will prompt where needed." >&2
+  exit 1
+fi
+
+# ---------- apt install helper (idempotent, non-fatal) ----------------------
+apt_install() {
+  local pkg="$1"
+  if dpkg -s "$pkg" >/dev/null 2>&1; then
+    INSTALLED+=("$pkg (already)")
+    ok "$pkg (already installed)"
+    return 0
+  fi
+  if sudo apt-get install -y "$pkg" >/dev/null 2>&1; then
+    INSTALLED+=("$pkg")
+    ok "$pkg"
+    return 0
+  else
+    FAILED_PKGS+=("$pkg")
+    err "$pkg — not available or failed"
+    return 1
   fi
 }
-require_user
+
+# ---------- step wrapper for non-apt operations -----------------------------
+run_step() {
+  local desc="$1"; shift
+  if "$@"; then
+    ok "$desc"
+    return 0
+  else
+    FAILED_STEPS+=("$desc")
+    err "$desc — failed (continuing)"
+    return 1
+  fi
+}
 
 REAPER_VERSION="7.72"
 REAPER_TARBALL="reaper${REAPER_VERSION//./}_linux_x86_64.tar.xz"
@@ -41,43 +81,50 @@ mkdir -p "$WORKDIR"
 # ============================================================================
 # SECTION 1 — System prep & realtime audio privileges
 # ============================================================================
-say "[1/12] System update + realtime audio privileges"
+say "[1/11] System update + realtime audio privileges"
 
-sudo apt-get update
-sudo apt-get install -y \
-  build-essential git curl wget xz-utils \
-  pkg-config autoconf automake libtool \
-  software-properties-common ca-certificates
+sudo apt-get update || warn "apt-get update returned non-zero (continuing)"
 
-# Audio group + realtime limits (PipeWire honors these for rtprio)
+for p in build-essential git curl wget xz-utils \
+         pkg-config autoconf automake libtool \
+         software-properties-common ca-certificates; do
+  apt_install "$p"
+done
+
 if ! getent group audio | grep -qw "$USER"; then
-  sudo usermod -aG audio "$USER"
-  warn "Added $USER to 'audio' group — log out/in (or reboot) to take effect."
+  if sudo usermod -aG audio "$USER"; then
+    ok "Added $USER to 'audio' group (re-login required)"
+  else
+    FAILED_STEPS+=("add user to audio group")
+  fi
+else
+  ok "$USER already in audio group"
 fi
 
-sudo tee /etc/security/limits.d/95-audio-tni.conf >/dev/null <<'EOF'
+if sudo tee /etc/security/limits.d/95-audio-tni.conf >/dev/null <<'EOF'
 # TNI studio realtime privileges
 @audio   -  rtprio     95
 @audio   -  memlock    unlimited
 @audio   -  nice       -19
 EOF
-ok "Realtime limits installed at /etc/security/limits.d/95-audio-tni.conf"
+then
+  ok "Realtime limits installed"
+else
+  FAILED_STEPS+=("realtime limits file")
+fi
 
 # ============================================================================
 # SECTION 2 — PipeWire / JACK / ALSA tooling
 # ============================================================================
-# Mint 22.3 ships PipeWire by default. We just ensure the JACK bridge is
-# present and add the ALSA-MIDI ↔ JACK bridge for Eurorack/MIDI-CV setups.
-say "[2/12] PipeWire JACK bridge + MIDI tooling"
+say "[2/11] PipeWire JACK bridge + MIDI tooling"
 
-sudo apt-get install -y \
-  pipewire pipewire-pulse pipewire-jack libspa-0.2-bluetooth \
-  wireplumber pipewire-audio-client-libraries \
-  qjackctl helvum pavucontrol \
-  a2jmidid jack-tools alsa-utils
-ok "PipeWire-JACK, Helvum patchbay, a2jmidid, qjackctl installed"
+for p in pipewire pipewire-pulse pipewire-jack libspa-0.2-bluetooth \
+         wireplumber pipewire-audio-client-libraries \
+         qjackctl helvum pavucontrol \
+         a2jmidid jack-tools alsa-utils; do
+  apt_install "$p"
+done
 
-# Sensible PipeWire defaults: 48 kHz, allow common rates, reasonable quantum
 mkdir -p "$HOME/.config/pipewire/pipewire.conf.d"
 cat > "$HOME/.config/pipewire/pipewire.conf.d/10-tni-rates.conf" <<'EOF'
 context.properties = {
@@ -88,218 +135,257 @@ context.properties = {
     default.clock.max-quantum   = 8192
 }
 EOF
-ok "PipeWire default rate locked to 48 kHz (TNI standard)"
+ok "PipeWire 48 kHz default written"
 
 # ============================================================================
-# SECTION 3 — Verify UMC1820 visible to ALSA (informational)
+# SECTION 3 — Audio device check (informational only)
 # ============================================================================
-say "[3/12] Audio device check"
-echo "Playback devices:" && aplay -l || true
-echo "Capture devices:"  && arecord -l || true
-warn "Confirm UMC1820 appears above. If not, plug it in & re-run from here."
+say "[3/11] Audio device check"
+echo "--- Playback devices ---"
+aplay -l 2>/dev/null || warn "aplay not yet available"
+echo "--- Capture devices ---"
+arecord -l 2>/dev/null || warn "arecord not yet available"
+warn "Confirm UMC1820 appears above (or plug it in & check later)"
 
 # ============================================================================
 # SECTION 4 — REAPER 7.72
 # ============================================================================
-say "[4/12] REAPER ${REAPER_VERSION}"
+say "[4/11] REAPER ${REAPER_VERSION}"
 
-if ! command -v reaper >/dev/null 2>&1; then
-  cd "$WORKDIR"
-  wget -nc "$REAPER_URL"
-  tar -xf "$REAPER_TARBALL"
-  cd "reaper_linux_x86_64"
-  # Non-interactive system-wide install
-  sudo ./install-reaper.sh --install /opt --integrate-desktop --quiet
-  ok "REAPER installed to /opt/REAPER"
+if command -v reaper >/dev/null 2>&1; then
+  ok "REAPER already installed"
+  INSTALLED+=("REAPER ${REAPER_VERSION} (already)")
 else
-  ok "REAPER already present, skipping"
+  cd "$WORKDIR"
+  if wget -nc "$REAPER_URL" 2>/dev/null && tar -xf "$REAPER_TARBALL"; then
+    cd "reaper_linux_x86_64"
+    if sudo ./install-reaper.sh --install /opt --integrate-desktop --quiet; then
+      ok "REAPER installed to /opt/REAPER"
+      INSTALLED+=("REAPER ${REAPER_VERSION}")
+    else
+      err "REAPER installer failed"
+      FAILED_STEPS+=("REAPER install")
+    fi
+  else
+    err "REAPER download/extract failed"
+    FAILED_STEPS+=("REAPER download")
+  fi
+  cd "$WORKDIR"
 fi
 
 # ============================================================================
-# SECTION 5 — REAPER extensions: SWS + ReaPack
+# SECTION 5 — REAPER extensions: SKIPPED (do via ReaPack GUI post-install)
 # ============================================================================
-# say "[5/12] REAPER extensions (SWS, ReaPack)"
-# 
-# REAPER_PLUGINS_DIR="$HOME/.config/REAPER/UserPlugins"
-# mkdir -p "$REAPER_PLUGINS_DIR"
-# 
-# ReaPack (the package manager — gateway to scripts/extensions ecosystem)
-# REAPACK_URL="https://reapack.com/latest/linux-x86_64"
-# if [[ ! -f "$REAPER_PLUGINS_DIR/reaper_reapack-x86_64.so" ]]; then
-#   wget -O "$REAPER_PLUGINS_DIR/reaper_reapack-x86_64.so" "$REAPACK_URL"
-#   ok "ReaPack installed → $REAPER_PLUGINS_DIR"
-# else
-#   ok "ReaPack already present"
-# fi
-# 
-# SWS Extension (must-have; adds hundreds of actions + script-friendly API)
-# SWS_URL="https://www.sws-extension.org/download/featured/sws-2.14.0.4-linux-x86_64.tar.xz"
-# if [[ ! -f "$REAPER_PLUGINS_DIR/reaper_sws-x86_64.so" ]]; then
-#   cd "$WORKDIR"
-#   wget -nc "$SWS_URL" -O sws.tar.xz
-#   tar -xf sws.tar.xz
-#   cp reaper_sws-x86_64.so "$REAPER_PLUGINS_DIR/"
-#   ok "SWS Extension installed"
-# else
-#   ok "SWS already present"
-# fi
-# 
-# warn "First REAPER launch: Extensions → ReaPack → Browse packages, then import"
-# warn "  https://github.com/ReaTeam/Extensions/raw/master/index.xml for ReaTeam"
+say "[5/11] REAPER extensions — SKIPPED"
+warn "ReaPack + SWS install via Reaper itself after first launch."
+warn "Instructions printed in the final summary."
+SKIPPED_STEPS+=("Section 5: ReaPack/SWS — install from inside REAPER")
 
 # ============================================================================
-# SECTION 6 — Ardour (secondary DAW, great for stem capture)
+# SECTION 6 — Ardour
 # ============================================================================
-say "[6/12] Ardour"
-sudo apt-get install -y ardour
-ok "Ardour installed"
+say "[6/11] Ardour"
+apt_install ardour
 
 # ============================================================================
-# SECTION 7 — Plugin packages (LV2 / VST / VST3 / CLAP friendly)
+# SECTION 7 — Plugin packages (per-package; tolerant of missing)
 # ============================================================================
-say "[7/12] Plugin packs"
-sudo apt-get install -y \
-  lsp-plugins \
-  calf-plugins \
-  x42-plugins \
-  zam-plugins \
-  dragonfly-reverb \
-  dpf-plugins-lv2 \
-  distrho-plugin-ports-lv2 \
-  noise-repellent \
-  swh-plugins \
-  caps
-ok "LSP, Calf, x42, ZAM, Dragonfly, DPF, distrho, swh, CAPS installed"
-
-# Carla — universal plugin host, can rack any plugin format and JACK-route it
-sudo apt-get install -y carla carla-bridges-native carla-data
-ok "Carla plugin host installed"
+say "[7/11] Plugin packs"
+for p in lsp-plugins calf-plugins x42-plugins zam-plugins \
+         dragonfly-reverb dpf-plugins-lv2 swh-plugins caps; do
+  apt_install "$p"
+done
+# Carla plugin host
+for p in carla carla-bridges-native carla-data; do
+  apt_install "$p"
+done
 
 # ============================================================================
 # SECTION 8 — Soft synths & instruments
 # ============================================================================
-say "[8/12] Soft synths"
-sudo apt-get install -y \
-  zynaddsubfx \
-  yoshimi \
-  surge-xt \
-  dexed \
-  helm \
-  hydrogen \
-  amsynth \
-  bristol
-ok "Synths installed: Zyn, Yoshimi, Surge XT, Dexed, Helm, Hydrogen, AMSynth, Bristol"
+say "[8/11] Soft synths"
+for p in zynaddsubfx yoshimi surge-xt dexed helm hydrogen amsynth bristol; do
+  apt_install "$p"
+done
 
 # ============================================================================
-# SECTION 9 — Overwitch (Elektron Digitakt → JACK multichannel)
+# SECTION 9 — Overwitch (Digitakt → JACK)
 # ============================================================================
-say "[9/12] Overwitch (Digitakt over USB)"
+say "[9/11] Overwitch"
 
-sudo apt-get install -y \
-  libjack-jackd2-dev \
-  libsamplerate0-dev \
-  libusb-1.0-0-dev \
-  libsndfile1-dev \
-  libgtk-3-dev \
-  libjson-glib-dev
+OW_DEPS_OK=true
+for p in libjack-jackd2-dev libsamplerate0-dev libusb-1.0-0-dev \
+         libsndfile1-dev libgtk-3-dev libjson-glib-dev; do
+  apt_install "$p" || OW_DEPS_OK=false
+done
 
-if ! command -v overwitch >/dev/null 2>&1; then
-  cd "$WORKDIR"
-  if [[ ! -d overwitch ]]; then
-    git clone https://github.com/dagargo/overwitch.git
-  fi
-  cd overwitch
-  autoreconf --install
-  ./configure
-  make -j"$(nproc)"
-  sudo make install
-  # Refresh udev so non-root can hit the Digitakt
-  sudo udevadm control --reload-rules
-  sudo udevadm trigger
-  ok "Overwitch built & installed; udev rules reloaded"
-else
+if command -v overwitch >/dev/null 2>&1; then
   ok "Overwitch already installed"
+  INSTALLED+=("overwitch (already)")
+elif ! $OW_DEPS_OK; then
+  err "Overwitch build deps missing — skipping build"
+  FAILED_STEPS+=("Overwitch build deps")
+else
+  cd "$WORKDIR"
+  build_overwitch() {
+    [[ -d overwitch ]] || git clone https://github.com/dagargo/overwitch.git || return 1
+    cd overwitch || return 1
+    autoreconf --install || return 1
+    ./configure || return 1
+    make -j"$(nproc)" || return 1
+    sudo make install || return 1
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger
+  }
+  if build_overwitch; then
+    ok "Overwitch built & installed"
+    INSTALLED+=("overwitch (from source)")
+  else
+    err "Overwitch build failed — check logs in $WORKDIR/overwitch"
+    FAILED_STEPS+=("Overwitch build")
+  fi
+  cd "$WORKDIR"
 fi
 
 # ============================================================================
-# SECTION 10 — Elektroid (sample/pattern transfer to/from Elektron gear)
+# SECTION 10 — Elektroid (also via apt; falls back to manual instruction)
 # ============================================================================
-say "[10/12] Elektroid"
+say "[10/11] Elektroid"
 if apt-cache show elektroid >/dev/null 2>&1; then
-  sudo apt-get install -y elektroid
-  ok "Elektroid installed from repo"
+  apt_install elektroid
 else
   warn "Elektroid not in repo — grab .deb from https://github.com/dagargo/elektroid/releases"
+  SKIPPED_STEPS+=("Elektroid: install .deb manually from GitHub releases")
 fi
 
 # ============================================================================
-# SECTION 11 — Python audio/MIDI toolkit (Reaper Python ReaScript + your tools)
+# SECTION 11 — Python venv + utilities
 # ============================================================================
-say "[11/12] Python audio/MIDI toolkit"
+say "[11/11] Python toolkit + utilities"
 
-sudo apt-get install -y python3 python3-pip python3-venv python3-dev
+for p in python3 python3-pip python3-venv python3-dev; do
+  apt_install "$p"
+done
 
-# Build a dedicated venv so we don't fight system Python
 TNI_VENV="$HOME/.venvs/tni"
 if [[ ! -d "$TNI_VENV" ]]; then
-  python3 -m venv "$TNI_VENV"
+  if python3 -m venv "$TNI_VENV"; then
+    ok "Created venv at $TNI_VENV"
+  else
+    FAILED_STEPS+=("create venv")
+  fi
 fi
-# shellcheck disable=SC1091
-source "$TNI_VENV/bin/activate"
-pip install --upgrade pip wheel
-pip install \
-  python-rtmidi \
-  mido \
-  sounddevice \
-  numpy scipy \
-  PyQt6 \
-  pyserial \
-  jack-client
-deactivate
-ok "Python venv at $TNI_VENV (activate with: source $TNI_VENV/bin/activate)"
 
-# Reaper Python ReaScript needs to know where Python lives. Reaper UI:
-#   Options → Preferences → Plug-ins → ReaScript
-#   Custom path = $TNI_VENV/lib
-#   Force ReaScript to use Python = python3.12 (or whatever your venv shows)
-warn "REAPER → Prefs → Plug-ins → ReaScript: point Python path at $TNI_VENV/lib"
+if [[ -f "$TNI_VENV/bin/activate" ]]; then
+  # shellcheck disable=SC1091
+  source "$TNI_VENV/bin/activate"
+  pip install --upgrade pip wheel >/dev/null 2>&1 || warn "pip upgrade failed"
+  for pypkg in python-rtmidi mido sounddevice numpy scipy PyQt6 pyserial jack-client; do
+    if pip install "$pypkg" >/dev/null 2>&1; then
+      ok "py: $pypkg"
+      INSTALLED+=("py: $pypkg")
+    else
+      err "py: $pypkg failed"
+      FAILED_PKGS+=("py: $pypkg")
+    fi
+  done
+  deactivate
+fi
 
-# ============================================================================
-# SECTION 12 — Quality-of-life utilities
-# ============================================================================
-say "[12/12] Utilities"
-sudo apt-get install -y \
-  audacity \
-  sox \
-  ffmpeg \
-  vmpk \
-  meterbridge \
-  jaaa \
-  jamin
-ok "Audacity, sox, ffmpeg, VMPK, meterbridge, JAAA, JAMin installed"
+# Quality-of-life utilities
+for p in audacity sox ffmpeg vmpk meterbridge jaaa jamin; do
+  apt_install "$p"
+done
 
 # ============================================================================
-# DONE
+# SUMMARY
 # ============================================================================
-say "Install complete"
+say "INSTALL SUMMARY"
+
+echo ""
+echo "  Installed (or already present): ${#INSTALLED[@]} items"
+echo ""
+
+if [[ ${#FAILED_PKGS[@]} -gt 0 ]]; then
+  printf "\033[1;33m  Failed packages (${#FAILED_PKGS[@]}):\033[0m\n"
+  for p in "${FAILED_PKGS[@]}"; do
+    echo "    - $p"
+  done
+  echo ""
+fi
+
+if [[ ${#FAILED_STEPS[@]} -gt 0 ]]; then
+  printf "\033[1;31m  Failed steps (${#FAILED_STEPS[@]}):\033[0m\n"
+  for s in "${FAILED_STEPS[@]}"; do
+    echo "    - $s"
+  done
+  echo ""
+fi
+
+if [[ ${#SKIPPED_STEPS[@]} -gt 0 ]]; then
+  printf "\033[1;36m  Intentionally skipped (handle manually):\033[0m\n"
+  for s in "${SKIPPED_STEPS[@]}"; do
+    echo "    - $s"
+  done
+  echo ""
+fi
+
 cat <<EOF
 
-  Reboot once so the audio-group + realtime limits take effect.
+────────────────────────────────────────────────────────────────────
+  NEXT STEPS
 
-  After reboot, verify quickly:
-    groups | grep audio        → should list 'audio'
-    ulimit -r                  → should be 95
-    pw-metadata -n settings 0  → should show clock.rate 48000
-    overwitch-cli -l           → should detect the Digitakt when plugged in
+  1.  Reboot to activate audio group + realtime limits:
+        sudo reboot
 
-  First REAPER launch:
-    1. Run 'reaper' from terminal or app menu
-    2. Audio prefs → Device: PipeWire (or ALSA hw:UMC1820 directly)
-    3. Sample rate: 48000, block: 256 (your TNI recording standard)
-    4. Extensions menu → ReaPack → Manage repositories → import
-       https://github.com/ReaTeam/Extensions/raw/master/index.xml
+  2.  After reboot, verify:
+        groups | grep audio        → should list 'audio'
+        ulimit -r                  → should be 95
+        pw-metadata -n settings 0  → should show clock.rate 48000
 
-  Workdir at $WORKDIR can be removed when you're confident:
-    rm -rf "$WORKDIR"
+  3.  Install ReaPack (REAPER package manager):
+        Visit https://reapack.com/ in a browser, click the Linux
+        x86_64 download, save the .so file to:
+          ~/.config/REAPER/UserPlugins/
+
+  4.  Launch REAPER (terminal: 'reaper').
+      a) Audio prefs → Device: PipeWire (or ALSA hw:UMC1820)
+      b) Sample rate: 48000, block: 256
+      c) Extensions → ReaPack → Browse packages → install:
+           - SWS/S&M Extension  (mandatory)
+           - ReaImGui           (modern script GUI)
+           - any cfillion/X-Raym scripts that catch your eye
+      d) Prefs → Plug-ins → ReaScript: point Python path at:
+           $TNI_VENV/lib
+
+  5.  Overwitch (Digitakt) sanity check:
+        overwitch-cli -l    # plug in Digitakt first
+        overwitch-service   # starts JACK client for it
+
+  6.  Workdir cleanup when confident:
+        rm -rf "$WORKDIR"
+
+────────────────────────────────────────────────────────────────────
 
 EOF
+
+# Write a machine-readable log too
+LOG="$HOME/tni_install_$(date +%Y%m%d_%H%M%S).log"
+{
+  echo "TNI install run: $(date)"
+  echo ""
+  echo "INSTALLED (${#INSTALLED[@]}):"
+  printf '  %s\n' "${INSTALLED[@]}"
+  echo ""
+  echo "FAILED PACKAGES (${#FAILED_PKGS[@]}):"
+  printf '  %s\n' "${FAILED_PKGS[@]}"
+  echo ""
+  echo "FAILED STEPS (${#FAILED_STEPS[@]}):"
+  printf '  %s\n' "${FAILED_STEPS[@]}"
+  echo ""
+  echo "SKIPPED STEPS (${#SKIPPED_STEPS[@]}):"
+  printf '  %s\n' "${SKIPPED_STEPS[@]}"
+} > "$LOG"
+
+echo "  Full log: $LOG"
+echo ""
