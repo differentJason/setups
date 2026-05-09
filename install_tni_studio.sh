@@ -118,34 +118,34 @@ fi
 # ============================================================================
 # SECTION 5 — REAPER extensions: SWS + ReaPack
 # ============================================================================
-say "[5/12] REAPER extensions (SWS, ReaPack)"
-
-REAPER_PLUGINS_DIR="$HOME/.config/REAPER/UserPlugins"
-mkdir -p "$REAPER_PLUGINS_DIR"
-
+# say "[5/12] REAPER extensions (SWS, ReaPack)"
+# 
+# REAPER_PLUGINS_DIR="$HOME/.config/REAPER/UserPlugins"
+# mkdir -p "$REAPER_PLUGINS_DIR"
+# 
 # ReaPack (the package manager — gateway to scripts/extensions ecosystem)
-REAPACK_URL="https://reapack.com/latest/linux-x86_64"
-if [[ ! -f "$REAPER_PLUGINS_DIR/reaper_reapack-x86_64.so" ]]; then
-  wget -O "$REAPER_PLUGINS_DIR/reaper_reapack-x86_64.so" "$REAPACK_URL"
-  ok "ReaPack installed → $REAPER_PLUGINS_DIR"
-else
-  ok "ReaPack already present"
-fi
-
+# REAPACK_URL="https://reapack.com/latest/linux-x86_64"
+# if [[ ! -f "$REAPER_PLUGINS_DIR/reaper_reapack-x86_64.so" ]]; then
+#   wget -O "$REAPER_PLUGINS_DIR/reaper_reapack-x86_64.so" "$REAPACK_URL"
+#   ok "ReaPack installed → $REAPER_PLUGINS_DIR"
+# else
+#   ok "ReaPack already present"
+# fi
+# 
 # SWS Extension (must-have; adds hundreds of actions + script-friendly API)
-SWS_URL="https://www.sws-extension.org/download/featured/sws-2.14.0.4-linux-x86_64.tar.xz"
-if [[ ! -f "$REAPER_PLUGINS_DIR/reaper_sws-x86_64.so" ]]; then
-  cd "$WORKDIR"
-  wget -nc "$SWS_URL" -O sws.tar.xz
-  tar -xf sws.tar.xz
-  cp reaper_sws-x86_64.so "$REAPER_PLUGINS_DIR/"
-  ok "SWS Extension installed"
-else
-  ok "SWS already present"
-fi
-
-warn "First REAPER launch: Extensions → ReaPack → Browse packages, then import"
-warn "  https://github.com/ReaTeam/Extensions/raw/master/index.xml for ReaTeam"
+# SWS_URL="https://www.sws-extension.org/download/featured/sws-2.14.0.4-linux-x86_64.tar.xz"
+# if [[ ! -f "$REAPER_PLUGINS_DIR/reaper_sws-x86_64.so" ]]; then
+#   cd "$WORKDIR"
+#   wget -nc "$SWS_URL" -O sws.tar.xz
+#   tar -xf sws.tar.xz
+#   cp reaper_sws-x86_64.so "$REAPER_PLUGINS_DIR/"
+#   ok "SWS Extension installed"
+# else
+#   ok "SWS already present"
+# fi
+# 
+# warn "First REAPER launch: Extensions → ReaPack → Browse packages, then import"
+# warn "  https://github.com/ReaTeam/Extensions/raw/master/index.xml for ReaTeam"
 
 # ============================================================================
 # SECTION 6 — Ardour (secondary DAW, great for stem capture)
